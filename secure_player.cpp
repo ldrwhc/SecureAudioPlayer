@@ -50,6 +50,7 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QQueue>
 #include <QRandomGenerator>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -89,7 +90,8 @@
 
 namespace {
 static const QByteArray kPakMagic = QByteArray::fromRawData("BUSAUD1\0", 8);
-static const QByteArray kSynthMagic = QByteArray::fromRawData("BUSSYN1\0", 8);
+static const QByteArray kSynthMagicV1 = QByteArray::fromRawData("BUSSYN1\0", 8);
+static const QByteArray kSynthMagicV2 = QByteArray::fromRawData("BUSSYN2\0", 8);
 static const QString kDefaultKey = QStringLiteral("BusAnnouncement@2026");
 
 struct AudioData {
@@ -150,7 +152,6 @@ struct PackManifest {
 
 struct PackageInfo {
     QString pakPath;
-    QByteArray zipBytes;
     QString packageFileNameLower;
     QString packageKindLower;
     bool isEnglishPack = false;
@@ -163,6 +164,7 @@ struct SourceEntry {
     QString zipEntryPath;
     QString zipEntryPathLower;
     QString diskPath;
+    QString encryptedBlobPath;
     QString baseFileName;
     QString stem;
     QString suffix;
@@ -174,6 +176,7 @@ struct SourceEntry {
 struct TrackItem {
     QString title;
     QString encryptedAudioPath;
+    int sourceIndex = -1; // preview/direct-play source, avoid pre-decoding to memory
 };
 
 QString formatMs(qint64 ms) {
@@ -255,6 +258,91 @@ bool decryptPak(const QString &pakPath, const QString &keyText, QByteArray *zipB
         return false;
     }
     *zipBytes = plain;
+    return true;
+}
+
+bool decryptPakToZipFile(const QString &pakPath, const QString &keyText, const QString &zipPath, QString *error) {
+    QFile in(pakPath);
+    if (!in.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("Cannot open pak: %1").arg(pakPath);
+        return false;
+    }
+    if (in.size() < 24) {
+        if (error) *error = QStringLiteral("Pak format invalid: %1").arg(QFileInfo(pakPath).fileName());
+        return false;
+    }
+
+    const QByteArray magic = in.read(8);
+    if (magic != kPakMagic) {
+        if (error) *error = QStringLiteral("Pak format invalid: %1").arg(QFileInfo(pakPath).fileName());
+        return false;
+    }
+    const QByteArray nonce = in.read(16);
+    if (nonce.size() != 16) {
+        if (error) *error = QStringLiteral("Pak nonce invalid: %1").arg(QFileInfo(pakPath).fileName());
+        return false;
+    }
+
+    QDir().mkpath(QFileInfo(zipPath).path());
+    QFile out(zipPath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (error) *error = QStringLiteral("Cannot create temp zip: %1").arg(zipPath);
+        return false;
+    }
+
+    const QByteArray key = keyText.toUtf8();
+    quint32 counter = 0;
+    QByteArray block;
+    int blockPos = 32;
+
+    auto refillBlock = [&]() {
+        QByteArray seed;
+        seed.reserve(key.size() + nonce.size() + 4);
+        seed.append(key);
+        seed.append(nonce);
+        QByteArray ctr(4, Qt::Uninitialized);
+        ctr[0] = static_cast<char>(counter & 0xFF);
+        ctr[1] = static_cast<char>((counter >> 8) & 0xFF);
+        ctr[2] = static_cast<char>((counter >> 16) & 0xFF);
+        ctr[3] = static_cast<char>((counter >> 24) & 0xFF);
+        seed.append(ctr);
+        block = QCryptographicHash::hash(seed, QCryptographicHash::Sha256);
+        ++counter;
+        blockPos = 0;
+    };
+
+    QByteArray signatureProbe;
+    signatureProbe.reserve(8);
+    while (!in.atEnd()) {
+        const QByteArray cipherChunk = in.read(1024 * 1024);
+        if (cipherChunk.isEmpty()) break;
+        QByteArray plainChunk(cipherChunk.size(), Qt::Uninitialized);
+        for (int i = 0; i < cipherChunk.size(); ++i) {
+            if (blockPos >= block.size()) refillBlock();
+            plainChunk[i] = static_cast<char>(static_cast<unsigned char>(cipherChunk[i]) ^
+                                              static_cast<unsigned char>(block[blockPos++]));
+        }
+        if (signatureProbe.size() < 8) {
+            const int need = 8 - signatureProbe.size();
+            signatureProbe.append(plainChunk.left(need));
+        }
+        if (out.write(plainChunk) != plainChunk.size()) {
+            if (error) *error = QStringLiteral("Temp zip write failed: %1").arg(zipPath);
+            out.close();
+            out.remove();
+            return false;
+        }
+    }
+    out.close();
+
+    const bool looksLikeZip = signatureProbe.startsWith("PK\x03\x04") ||
+                              signatureProbe.startsWith("PK\x05\x06") ||
+                              signatureProbe.startsWith("PK\x07\x08");
+    if (!looksLikeZip) {
+        if (error) *error = QStringLiteral("Pak decrypt failed: %1").arg(QFileInfo(pakPath).fileName());
+        QFile::remove(zipPath);
+        return false;
+    }
     return true;
 }
 
@@ -407,6 +495,17 @@ QStringList readXlsxStations(const QString &path) {
         }
     }
     return stationList;
+}
+
+bool isHighQualityExportStem(const QString &stem) {
+    const QString base = stem.trimmed();
+    if (base.isEmpty()) return false;
+    static const QRegularExpression pureNumberPattern(QStringLiteral("^\\d+$"));
+    static const QRegularExpression suffixDigitsPattern(QStringLiteral("\\d+$"));
+    if (base.contains(QLatin1Char('#'))) return false;
+    if (pureNumberPattern.match(base).hasMatch()) return false;
+    if (suffixDigitsPattern.match(base).hasMatch()) return false;
+    return true;
 }
 
 QString xmlEscaped(QString text) {
@@ -645,6 +744,29 @@ AudioData combineAudio(const QList<AudioData> &audioList) {
     return out;
 }
 
+AudioData createSilentAudioMs(int durationMs, const QAudioFormat &formatHint = QAudioFormat()) {
+    const int ms = qMax(1, durationMs);
+    AudioData silent;
+    if (formatHint.isValid() && formatHint.sampleRate() > 0 && formatHint.bytesPerFrame() > 0 &&
+        formatHint.sampleFormat() == QAudioFormat::Int16) {
+        silent.format = formatHint;
+    } else {
+        silent.format.setSampleRate(44100);
+        silent.format.setChannelCount(1);
+        silent.format.setSampleFormat(QAudioFormat::Int16);
+    }
+    const int frameBytes = qMax(1, silent.format.bytesPerFrame());
+    const int sampleRate = qMax(8000, silent.format.sampleRate());
+    qint64 targetBytes = (static_cast<qint64>(frameBytes) * sampleRate * ms) / 1000;
+    if (targetBytes < frameBytes) targetBytes = frameBytes;
+    const qint64 rem = targetBytes % frameBytes;
+    if (rem != 0) targetBytes += (frameBytes - rem);
+    silent.pcmData.fill('\0', static_cast<int>(targetBytes));
+    const int bps = frameBytes * sampleRate;
+    silent.durationMs = bps > 0 ? (silent.pcmData.size() * 1000LL) / bps : ms;
+    return silent;
+}
+
 bool saveAudioToWav(const AudioData &audio, const QString &outputPath) {
     if (!audio.isValid()) return false;
     QFile out(outputPath);
@@ -689,12 +811,18 @@ bool writeEncryptedBlob(const QByteArray &plainBytes, const QString &outputPath,
     for (int i = 0; i < nonce.size(); ++i) {
         nonce[i] = static_cast<char>(QRandomGenerator::global()->bounded(256));
     }
-    const QByteArray cipher = xorStreamCipher(plainBytes, keyText.toUtf8(), nonce);
+    const QByteArray keySeed = QCryptographicHash::hash(
+        keyText.toUtf8() + QByteArrayLiteral("|BUS-BLOB-V2|") + nonce, QCryptographicHash::Sha256);
+    const QByteArray cipher = xorStreamCipher(plainBytes, keySeed, nonce);
+    const QByteArray tag = QCryptographicHash::hash(
+                               keySeed + QByteArrayLiteral("|TAG|") + nonce + cipher, QCryptographicHash::Sha256)
+                               .left(16);
 
     QByteArray all;
-    all.reserve(kSynthMagic.size() + nonce.size() + cipher.size());
-    all.append(kSynthMagic);
+    all.reserve(kSynthMagicV2.size() + nonce.size() + tag.size() + cipher.size());
+    all.append(kSynthMagicV2);
     all.append(nonce);
+    all.append(tag);
     all.append(cipher);
 
     QDir().mkpath(QFileInfo(outputPath).path());
@@ -717,18 +845,42 @@ bool readEncryptedBlob(const QString &encryptedPath, const QString &keyText, QBy
         return false;
     }
     const QByteArray all = file.readAll();
-    if (all.size() < (kSynthMagic.size() + 16) || all.first(kSynthMagic.size()) != kSynthMagic) {
-        if (error) *error = QStringLiteral("加密音频格式错误：%1").arg(QFileInfo(encryptedPath).fileName());
-        return false;
+    if (all.size() >= (kSynthMagicV2.size() + 32) && all.first(kSynthMagicV2.size()) == kSynthMagicV2) {
+        const QByteArray nonce = all.mid(kSynthMagicV2.size(), 16);
+        const QByteArray tag = all.mid(kSynthMagicV2.size() + 16, 16);
+        const QByteArray cipher = all.mid(kSynthMagicV2.size() + 32);
+        const QByteArray keySeed = QCryptographicHash::hash(
+            keyText.toUtf8() + QByteArrayLiteral("|BUS-BLOB-V2|") + nonce, QCryptographicHash::Sha256);
+        const QByteArray expectTag = QCryptographicHash::hash(
+                                         keySeed + QByteArrayLiteral("|TAG|") + nonce + cipher, QCryptographicHash::Sha256)
+                                         .left(16);
+        if (expectTag != tag) {
+            if (error) *error = QStringLiteral("加密音频校验失败：%1").arg(QFileInfo(encryptedPath).fileName());
+            return false;
+        }
+        const QByteArray plain = xorStreamCipher(cipher, keySeed, nonce);
+        if (plain.isEmpty()) {
+            if (error) *error = QStringLiteral("解密后音频为空：%1").arg(QFileInfo(encryptedPath).fileName());
+            return false;
+        }
+        *plainBytes = plain;
+        return true;
     }
-    const QByteArray nonce = all.mid(kSynthMagic.size(), 16);
-    const QByteArray plain = xorStreamCipher(all.mid(kSynthMagic.size() + 16), keyText.toUtf8(), nonce);
-    if (plain.isEmpty()) {
-        if (error) *error = QStringLiteral("解密后音频为空：%1").arg(QFileInfo(encryptedPath).fileName());
-        return false;
+
+    // 兼容旧格式 BUSSYN1
+    if (all.size() >= (kSynthMagicV1.size() + 16) && all.first(kSynthMagicV1.size()) == kSynthMagicV1) {
+        const QByteArray nonce = all.mid(kSynthMagicV1.size(), 16);
+        const QByteArray plain = xorStreamCipher(all.mid(kSynthMagicV1.size() + 16), keyText.toUtf8(), nonce);
+        if (plain.isEmpty()) {
+            if (error) *error = QStringLiteral("解密后音频为空：%1").arg(QFileInfo(encryptedPath).fileName());
+            return false;
+        }
+        *plainBytes = plain;
+        return true;
     }
-    *plainBytes = plain;
-    return true;
+
+    if (error) *error = QStringLiteral("加密音频格式错误：%1").arg(QFileInfo(encryptedPath).fileName());
+    return false;
 }
 } // namespace
 
@@ -891,6 +1043,7 @@ private:
     QString m_promptDir;
     QString m_sessionDir;
     QString m_packKey = kDefaultKey;
+    QString m_sessionBlobKey;
 
     QVector<TemplateConfig> m_templates;
     QVector<PackageInfo> m_packages;
@@ -901,10 +1054,13 @@ private:
     QHash<QString, int> m_bestResourceByLowerName;
 
     QHash<QString, QByteArray> m_entryRawCache;
+    QQueue<QString> m_entryRawOrder;
+    qint64 m_entryRawCacheBytes = 0;
     QHash<QString, AudioData> m_entryAudioCache;
     QHash<QString, AudioData> m_stationAudioCache;
     QHash<QString, int> m_stationSourceIdxCache;
     QHash<QString, AudioData> m_resourceAudioCache;
+    static constexpr qint64 kEntryRawCacheLimitBytes = 24 * 1024 * 1024; // 24MB
 
     int resourceSourceScore(const SourceEntry &s) const {
         int score = extensionPriority(s.suffix) * 100;
@@ -1121,6 +1277,19 @@ private:
             "QToolButton:pressed { background: #3a4452; }"));
     }
 
+    void stylePreviewActionButton(QToolButton *btn) {
+        if (!btn) return;
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        btn->setIconSize(QSize(16, 16));
+        btn->setMinimumHeight(34);
+        btn->setStyleSheet(QStringLiteral(
+            "QToolButton { background: #2b313b; border: 1px solid #4b5566; border-radius: 6px; padding: 6px 10px; }"
+            "QToolButton:hover { background: #36404d; }"
+            "QToolButton:pressed { background: #3a4452; }"
+            "QToolButton::menu-indicator { subcontrol-origin: padding; subcontrol-position: right center; right: 6px; }"));
+    }
+
     void updateVolumeValueUi(int value, bool showTip) {
         const int v = qBound(0, value, 100);
         if (m_volumeValueLabel) m_volumeValueLabel->setText(QStringLiteral("%1%").arg(v));
@@ -1218,11 +1387,64 @@ private:
         return s.isEnglish ? QString::fromUtf8(u8"英文") : QString::fromUtf8(u8"中文");
     }
 
-    bool ensureSourceIndexReady(QString *error) {
-        if (m_sources.isEmpty()) {
-            if (!loadSourcesForSession(error)) return false;
+    QString sourceDisplayName(const SourceEntry &s) const {
+        return s.stem.isEmpty() ? QFileInfo(s.baseFileName).completeBaseName() : s.stem;
+    }
+
+    void clearEntryRawCache() {
+        m_entryRawCache.clear();
+        m_entryRawOrder.clear();
+        m_entryRawCacheBytes = 0;
+    }
+
+    void cacheEntryRawBytes(const QString &key, const QByteArray &bytes) {
+        if (key.isEmpty() || bytes.isEmpty()) return;
+        if (bytes.size() > kEntryRawCacheLimitBytes) return;
+
+        if (m_entryRawCache.contains(key)) {
+            m_entryRawCacheBytes -= m_entryRawCache.value(key).size();
+            m_entryRawOrder.removeAll(key);
         }
-        return true;
+        m_entryRawCache.insert(key, bytes);
+        m_entryRawOrder.enqueue(key);
+        m_entryRawCacheBytes += bytes.size();
+
+        while (m_entryRawCacheBytes > kEntryRawCacheLimitBytes && !m_entryRawOrder.isEmpty()) {
+            const QString oldKey = m_entryRawOrder.dequeue();
+            if (!m_entryRawCache.contains(oldKey)) continue;
+            m_entryRawCacheBytes -= m_entryRawCache.value(oldKey).size();
+            m_entryRawCache.remove(oldKey);
+        }
+    }
+
+    void replacePlaylistWithSourceIndices(const QVector<int> &sourceIndices, const QString &reason) {
+        stopAndDetachPlayer();
+        m_tracks.clear();
+        m_playlist->clear();
+        m_tracks.reserve(sourceIndices.size());
+        for (int idx : sourceIndices) {
+            if (idx < 0 || idx >= m_sources.size()) continue;
+            const SourceEntry &s = m_sources[idx];
+            TrackItem t;
+            t.sourceIndex = idx;
+            t.title = QStringLiteral("[%1]%2")
+                          .arg(s.isEnglish ? QString::fromUtf8(u8"英") : QString::fromUtf8(u8"中"))
+                          .arg(sourceDisplayName(s));
+            m_tracks.push_back(t);
+            m_playlist->addItem(t.title);
+        }
+        if (!m_tracks.isEmpty()) {
+            m_playlist->setCurrentRow(0);
+            m_statusLabel->setText(QString::fromUtf8(u8"已载入%1：%2 条").arg(reason).arg(m_tracks.size()));
+            appendLog(QString::fromUtf8(u8"播放列表替换为%1，共 %2 条").arg(reason).arg(m_tracks.size()));
+        } else {
+            m_statusLabel->setText(QString::fromUtf8(u8"播放列表为空"));
+            appendLog(QString::fromUtf8(u8"播放列表替换失败：没有可用条目"), true);
+        }
+    }
+
+    bool ensureSourceIndexReady(QString *error) {
+        return ensureSessionAndSources(error);
     }
 
     void openPreviewDialog() {
@@ -1270,8 +1492,8 @@ private:
         std::sort(previewIndices.begin(), previewIndices.end(), [this, &collator](int a, int b) {
             const SourceEntry &sa = m_sources[a];
             const SourceEntry &sb = m_sources[b];
-            const QString nameA = sa.stem.isEmpty() ? QFileInfo(sa.baseFileName).completeBaseName() : sa.stem;
-            const QString nameB = sb.stem.isEmpty() ? QFileInfo(sb.baseFileName).completeBaseName() : sb.stem;
+            const QString nameA = sourceDisplayName(sa);
+            const QString nameB = sourceDisplayName(sb);
             const int nameCmp = collator.compare(nameA, nameB);
             if (nameCmp != 0) return nameCmp < 0;
             if (sa.isEnglish != sb.isEnglish) return !sa.isEnglish && sb.isEnglish; // Chinese first under same name
@@ -1313,11 +1535,29 @@ private:
         root->addWidget(tip);
 
         auto *btnRow = new QHBoxLayout();
-        auto *playBtn = new QPushButton(QString::fromUtf8(u8"播放选中"), &dlg);
-        auto *stopBtn = new QPushButton(QString::fromUtf8(u8"停止"), &dlg);
+        auto *playBtn = new QToolButton(&dlg);
+        auto *stopBtn = new QToolButton(&dlg);
+        auto *batchPlayBtn = new QToolButton(&dlg);
+        playBtn->setText(QString::fromUtf8(u8"播放选中"));
+        stopBtn->setText(QString::fromUtf8(u8"停止"));
+        batchPlayBtn->setText(QString::fromUtf8(u8"一键播放"));
+        playBtn->setIcon(monoStyleIcon(QStyle::SP_MediaPlay));
+        stopBtn->setIcon(monoStyleIcon(QStyle::SP_MediaStop));
+        batchPlayBtn->setIcon(monoStyleIcon(QStyle::SP_MediaSeekForward));
+        stylePreviewActionButton(playBtn);
+        stylePreviewActionButton(stopBtn);
+        stylePreviewActionButton(batchPlayBtn);
+        batchPlayBtn->setPopupMode(QToolButton::InstantPopup);
+        auto *batchMenu = new QMenu(batchPlayBtn);
+        QAction *actPlayAll = batchMenu->addAction(QString::fromUtf8(u8"播放全部"));
+        QAction *actPlayZh = batchMenu->addAction(QString::fromUtf8(u8"播放全部中文"));
+        QAction *actPlayEn = batchMenu->addAction(QString::fromUtf8(u8"播放全部英文"));
+        QAction *actPlayHQ = batchMenu->addAction(QString::fromUtf8(u8"播放全部高音质"));
+        batchPlayBtn->setMenu(batchMenu);
         auto *closeBtn = new QPushButton(QString::fromUtf8(u8"关闭"), &dlg);
         btnRow->addWidget(playBtn);
         btnRow->addWidget(stopBtn);
+        btnRow->addWidget(batchPlayBtn);
         btnRow->addStretch();
         btnRow->addWidget(closeBtn);
         root->addLayout(btnRow);
@@ -1332,7 +1572,7 @@ private:
                 const SourceEntry &s = m_sources[idx];
                 if (langFilter == 1 && s.isEnglish) continue;
                 if (langFilter == 2 && !s.isEnglish) continue;
-                const QString displayName = s.stem.isEmpty() ? QFileInfo(s.baseFileName).completeBaseName() : s.stem;
+                const QString displayName = sourceDisplayName(s);
                 const QString hay =
                     (displayName + QLatin1Char(' ') + s.baseFileName + QLatin1Char(' ') + s.stem + QLatin1Char(' ') + s.zipEntryPath + QLatin1Char(' ') +
                      s.diskPath)
@@ -1373,14 +1613,54 @@ private:
             appendLog(QString::fromUtf8(u8"预览播放：%1").arg(s.baseFileName));
         };
 
+        auto buildBatchIndices = [&](int mode) {
+            QVector<int> out;
+            out.reserve(previewIndices.size());
+            if (mode == 0 || mode == 1 || mode == 2) {
+                for (int idx : std::as_const(previewIndices)) {
+                    const SourceEntry &s = m_sources[idx];
+                    if (mode == 1 && s.isEnglish) continue;
+                    if (mode == 2 && !s.isEnglish) continue;
+                    out.push_back(idx);
+                }
+                return out;
+            }
+
+            // mode == 3: align with main2.cpp "导出高音质" rule:
+            // only Chinese mp3, no '#', no pure number, no trailing digits.
+            for (int idx : std::as_const(previewIndices)) {
+                const SourceEntry &s = m_sources[idx];
+                if (s.isEnglish) continue;
+                if (s.suffix != QLatin1String("mp3")) continue;
+                const QString stem = QFileInfo(s.baseFileName).completeBaseName().trimmed();
+                if (!isHighQualityExportStem(stem)) continue;
+                out.push_back(idx);
+            }
+            return out;
+        };
+
+        auto triggerBatchPlay = [&](int mode, const QString &label) {
+            const QVector<int> indices = buildBatchIndices(mode);
+            if (indices.isEmpty()) {
+                QMessageBox::information(&dlg, QString::fromUtf8(u8"一键播放"), QString::fromUtf8(u8"没有可播放条目"));
+                return;
+            }
+            replacePlaylistWithSourceIndices(indices, label);
+            dlg.accept();
+        };
+
         connect(searchEdit, &QLineEdit::textChanged, &dlg, [refreshList]() { refreshList(); });
         connect(searchEdit, &QLineEdit::returnPressed, &dlg, [playSelected]() { playSelected(); });
         connect(allBtn, &QRadioButton::toggled, &dlg, [refreshList](bool) { refreshList(); });
         connect(zhBtn, &QRadioButton::toggled, &dlg, [refreshList](bool) { refreshList(); });
         connect(enBtn, &QRadioButton::toggled, &dlg, [refreshList](bool) { refreshList(); });
         connect(list, &QListWidget::itemDoubleClicked, &dlg, [playSelected](QListWidgetItem *) { playSelected(); });
-        connect(playBtn, &QPushButton::clicked, &dlg, [playSelected]() { playSelected(); });
-        connect(stopBtn, &QPushButton::clicked, &dlg, [this]() { stopAndDetachPlayer(); });
+        connect(playBtn, &QToolButton::clicked, &dlg, [playSelected]() { playSelected(); });
+        connect(stopBtn, &QToolButton::clicked, &dlg, [this]() { stopAndDetachPlayer(); });
+        connect(actPlayAll, &QAction::triggered, &dlg, [triggerBatchPlay]() { triggerBatchPlay(0, QString::fromUtf8(u8"全部音频")); });
+        connect(actPlayZh, &QAction::triggered, &dlg, [triggerBatchPlay]() { triggerBatchPlay(1, QString::fromUtf8(u8"全部中文")); });
+        connect(actPlayEn, &QAction::triggered, &dlg, [triggerBatchPlay]() { triggerBatchPlay(2, QString::fromUtf8(u8"全部英文")); });
+        connect(actPlayHQ, &QAction::triggered, &dlg, [triggerBatchPlay]() { triggerBatchPlay(3, QString::fromUtf8(u8"全部高音质")); });
         connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
 
         refreshList();
@@ -3481,10 +3761,48 @@ private:
                                    .arg(QCoreApplication::applicationPid())
                                    .arg(QDateTime::currentMSecsSinceEpoch());
         m_sessionDir = QDir(tempRoot).absoluteFilePath(unique);
-        return QDir().mkpath(m_sessionDir);
+        if (!QDir().mkpath(m_sessionDir)) return false;
+
+        QByteArray nonce(32, Qt::Uninitialized);
+        for (int i = 0; i < nonce.size(); ++i) nonce[i] = static_cast<char>(QRandomGenerator::global()->bounded(256));
+        const QByteArray seed = nonce + m_packKey.toUtf8() +
+                                QByteArray::number(QCoreApplication::applicationPid()) +
+                                QByteArray::number(QDateTime::currentMSecsSinceEpoch());
+        m_sessionBlobKey = QString::fromLatin1(QCryptographicHash::hash(seed, QCryptographicHash::Sha256).toHex());
+        return true;
+    }
+
+    bool ensureSessionDirReady() {
+        if (!m_sessionDir.isEmpty()) {
+            if (m_sessionBlobKey.isEmpty()) {
+                QByteArray seed = m_packKey.toUtf8() +
+                                  QByteArray::number(QCoreApplication::applicationPid()) +
+                                  QByteArray::number(QDateTime::currentMSecsSinceEpoch());
+                m_sessionBlobKey = QString::fromLatin1(QCryptographicHash::hash(seed, QCryptographicHash::Sha256).toHex());
+            }
+            return true;
+        }
+        const QString tempRoot = QDir(m_runtimeRoot).absoluteFilePath(QStringLiteral("_runtime_tmp/SecureAudioPlayer"));
+        if (!QDir().mkpath(tempRoot)) return false;
+        const QString unique = QStringLiteral("%1_%2")
+                                   .arg(QCoreApplication::applicationPid())
+                                   .arg(QDateTime::currentMSecsSinceEpoch());
+        m_sessionDir = QDir(tempRoot).absoluteFilePath(unique);
+        if (!QDir().mkpath(m_sessionDir)) return false;
+
+        QByteArray nonce(32, Qt::Uninitialized);
+        for (int i = 0; i < nonce.size(); ++i) nonce[i] = static_cast<char>(QRandomGenerator::global()->bounded(256));
+        const QByteArray seed = nonce + m_packKey.toUtf8() +
+                                QByteArray::number(QCoreApplication::applicationPid()) +
+                                QByteArray::number(QDateTime::currentMSecsSinceEpoch());
+        m_sessionBlobKey = QString::fromLatin1(QCryptographicHash::hash(seed, QCryptographicHash::Sha256).toHex());
+        return true;
     }
 
     QString sourceKey(const SourceEntry &s) const {
+        if (!s.encryptedBlobPath.isEmpty()) {
+            return QStringLiteral("enc|%1").arg(QDir::cleanPath(s.encryptedBlobPath).toLower());
+        }
         if (!s.diskPath.isEmpty()) {
             return QStringLiteral("disk|%1").arg(QDir::cleanPath(s.diskPath).toLower());
         }
@@ -3499,22 +3817,23 @@ private:
         m_bestResourceByLowerPath.clear();
         m_bestResourceByLowerName.clear();
         m_packKey = manifest.key.isEmpty() ? kDefaultKey : manifest.key;
+        clearEntryRawCache();
+        if (!ensureSessionDirReady()) {
+            if (error) *error = QString::fromUtf8(u8"无法创建低内存会话目录");
+            return false;
+        }
+        const QString pakZipWorkDir = QDir(m_sessionDir).absoluteFilePath(QStringLiteral("pak_work_zip"));
+        const QString encryptedEntryDir = QDir(m_sessionDir).absoluteFilePath(QStringLiteral("pak_entry_cache"));
+        QDir().mkpath(pakZipWorkDir);
+        QDir().mkpath(encryptedEntryDir);
 
         for (const QString &pkgName : manifest.packages) {
             QFileInfo fi(pkgName);
             const QString pakPath = fi.isAbsolute() ? fi.absoluteFilePath() : QDir(m_packsDir).absoluteFilePath(pkgName);
             if (!QFile::exists(pakPath)) continue;
 
-            QByteArray zipBytes;
-            QString err;
-            if (!decryptPak(pakPath, manifest.key, &zipBytes, &err)) {
-                if (error) *error = err;
-                return false;
-            }
-
             PackageInfo p;
             p.pakPath = pakPath;
-            p.zipBytes = zipBytes;
             const QString pakBase = QFileInfo(pakPath).completeBaseName().toLower();
             p.packageFileNameLower = QFileInfo(pakPath).fileName().toLower();
             const QString kind = manifest.kindsByPackageLower.value(p.packageFileNameLower).toLower();
@@ -3528,24 +3847,11 @@ private:
                                  pakBase.contains(QString::fromUtf8(u8"提示")) ||
                                  pakBase.contains(QString::fromUtf8(u8"发车通知"));
             }
-            m_packages.push_back(p);
-        }
-        if (m_packages.isEmpty()) {
-            if (error) *error = QString::fromUtf8(u8"未加载到任何 pak 文件");
-            return false;
-        }
 
-        for (int i = 0; i < m_packages.size(); ++i) {
-            QBuffer zipBuffer;
-            zipBuffer.setData(m_packages[i].zipBytes);
-            zipBuffer.open(QIODevice::ReadOnly);
-            QZipReader zip(&zipBuffer);
-            if (zip.status() != QZipReader::NoError) {
-                if (error) *error = QString::fromUtf8(u8"Zip 打开失败：%1").arg(m_packages[i].pakPath);
-                return false;
-            }
+            const int packageIndex = m_packages.size();
+            m_packages.push_back(p);
             const QHash<QString, QString> aliasMap =
-                manifest.aliasesByPackageLower.value(m_packages[i].packageFileNameLower);
+                manifest.aliasesByPackageLower.value(m_packages[packageIndex].packageFileNameLower);
 
             int numericPromptCount = 0;
             for (int k = 1; k <= 6; ++k) {
@@ -3559,13 +3865,37 @@ private:
                     }
                 }
             }
-            if (numericPromptCount >= 3) {
-                m_packages[i].isPromptPack = true;
+            if (numericPromptCount >= 3) m_packages[packageIndex].isPromptPack = true;
+
+            QString err;
+            const QString zipPath = QDir(pakZipWorkDir).absoluteFilePath(
+                QStringLiteral("%1_%2.work.zip").arg(packageIndex, 3, 10, QChar('0')).arg(QFileInfo(pakPath).completeBaseName()));
+            if (!decryptPakToZipFile(pakPath, m_packKey, zipPath, &err)) {
+                if (error) *error = err;
+                return false;
             }
 
-            for (const QZipReader::FileInfo &fi : zip.fileInfoList()) {
-                if (fi.isDir) continue;
-                const QString aliasFile = QFileInfo(fi.filePath).fileName();
+            QFile zipFile(zipPath);
+            if (!zipFile.open(QIODevice::ReadOnly)) {
+                QFile::remove(zipPath);
+                if (error) *error = QString::fromUtf8(u8"Zip 打开失败：%1").arg(zipPath);
+                return false;
+            }
+            QZipReader zip(&zipFile);
+            if (zip.status() != QZipReader::NoError) {
+                zipFile.close();
+                QFile::remove(zipPath);
+                if (error) *error = QString::fromUtf8(u8"Zip 打开失败：%1").arg(m_packages[packageIndex].pakPath);
+                return false;
+            }
+
+            const QString packEntryDir = QDir(encryptedEntryDir).absoluteFilePath(
+                QStringLiteral("pkg_%1").arg(packageIndex, 3, 10, QChar('0')));
+            QDir().mkpath(packEntryDir);
+
+            for (const QZipReader::FileInfo &fiInZip : zip.fileInfoList()) {
+                if (fiInZip.isDir) continue;
+                const QString aliasFile = QFileInfo(fiInZip.filePath).fileName();
                 const QString aliasKey = aliasFile.toLower();
                 QString logicalFile = aliasMap.value(aliasKey);
                 if (logicalFile.isEmpty()) logicalFile = aliasFile;
@@ -3576,18 +3906,38 @@ private:
                 }
                 if (!isAudioSuffix(suffix)) continue;
 
+                const QByteArray plainBytes = zip.fileData(fiInZip.filePath);
+                if (plainBytes.isEmpty()) continue;
+
+                const QByteArray hashSeed =
+                    m_packages[packageIndex].packageFileNameLower.toUtf8() + QByteArrayLiteral("|") +
+                    fiInZip.filePath.toUtf8() + QByteArrayLiteral("|") + logicalFile.toUtf8();
+                const QString encryptedName =
+                    QString::fromLatin1(QCryptographicHash::hash(hashSeed, QCryptographicHash::Sha1).toHex().left(24)) +
+                    QStringLiteral(".benc");
+                const QString encryptedPath = QDir(packEntryDir).absoluteFilePath(encryptedName);
+                QString encErr;
+                if (!writeEncryptedBlob(plainBytes, encryptedPath, m_sessionBlobKey, &encErr)) {
+                    zipFile.close();
+                    QFile::remove(zipPath);
+                    if (error) *error = QString::fromUtf8(u8"pak 条目加密缓存失败：%1").arg(encErr);
+                    return false;
+                }
+
                 SourceEntry s;
-                s.packageIndex = i;
-                s.zipEntryPath = fi.filePath;
-                s.zipEntryPathLower = fi.filePath.toLower();
+                s.packageIndex = packageIndex;
+                s.zipEntryPath = fiInZip.filePath;
+                s.zipEntryPathLower = fiInZip.filePath.toLower();
+                s.encryptedBlobPath = encryptedPath;
                 s.baseFileName = logicalInfo.fileName();
                 if (s.baseFileName.isEmpty()) s.baseFileName = aliasFile;
                 s.stem = QFileInfo(s.baseFileName).completeBaseName().trimmed();
                 s.suffix = suffix;
-                s.isEnglish = m_packages[i].isEnglishPack;
-                s.isTemplate = m_packages[i].isTemplatePack || s.zipEntryPathLower.startsWith(QStringLiteral("template/"));
+                s.isEnglish = m_packages[packageIndex].isEnglishPack;
+                s.isTemplate =
+                    m_packages[packageIndex].isTemplatePack || s.zipEntryPathLower.startsWith(QStringLiteral("template/"));
                 const QString logicalLower = logicalFile.toLower();
-                s.isPrompt = m_packages[i].isPromptPack ||
+                s.isPrompt = m_packages[packageIndex].isPromptPack ||
                              logicalLower.contains(QString::fromUtf8(u8"提示")) ||
                              logicalLower.contains(QString::fromUtf8(u8"转弯")) ||
                              logicalLower.contains(QString::fromUtf8(u8"让座")) ||
@@ -3610,6 +3960,14 @@ private:
                     m_bestResourceByLowerName.insert(lowerName, idx);
                 }
             }
+
+            zipFile.close();
+            QFile::remove(zipPath);
+        }
+
+        if (m_packages.isEmpty()) {
+            if (error) *error = QString::fromUtf8(u8"未加载到任何 pak 文件");
+            return false;
         }
         if (m_sources.isEmpty()) {
             if (error) *error = QString::fromUtf8(u8"pak 中没有可用音频");
@@ -3711,6 +4069,15 @@ private:
         if (m_entryRawCache.contains(key)) {
             return m_entryRawCache.value(key);
         }
+        if (!s.encryptedBlobPath.isEmpty()) {
+            QByteArray bytes;
+            const QString encKey = m_sessionBlobKey.isEmpty() ? m_packKey : m_sessionBlobKey;
+            if (!readEncryptedBlob(s.encryptedBlobPath, encKey, &bytes, error)) {
+                return QByteArray();
+            }
+            cacheEntryRawBytes(key, bytes);
+            return bytes;
+        }
         if (!s.diskPath.isEmpty()) {
             QFile file(s.diskPath);
             if (!file.open(QIODevice::ReadOnly)) {
@@ -3718,23 +4085,11 @@ private:
                 return QByteArray();
             }
             const QByteArray bytes = file.readAll();
-            m_entryRawCache.insert(key, bytes);
+            cacheEntryRawBytes(key, bytes);
             return bytes;
         }
-        if (s.packageIndex < 0 || s.packageIndex >= m_packages.size()) return QByteArray();
-
-        QBuffer zipBuffer;
-        zipBuffer.setData(m_packages[s.packageIndex].zipBytes);
-        zipBuffer.open(QIODevice::ReadOnly);
-        QZipReader zip(&zipBuffer);
-        if (zip.status() != QZipReader::NoError) return QByteArray();
-        const QByteArray bytes = zip.fileData(s.zipEntryPath);
-        if (bytes.isEmpty()) {
-            if (error) *error = QStringLiteral("Extract fail: %1").arg(s.zipEntryPath);
-            return QByteArray();
-        }
-        m_entryRawCache.insert(key, bytes);
-        return bytes;
+        if (error) *error = QStringLiteral("Source missing: %1").arg(s.baseFileName);
+        return QByteArray();
     }
 
     AudioData audioForSource(const SourceEntry &s, QString *error) {
@@ -4034,19 +4389,8 @@ private:
             if (m_synthOptions.missingEngUseChinese && fallback.isValid()) {
                 out = fallback;
             } else {
-                AudioData silent;
-                silent.format = fallback.format;
-                if (!silent.format.isValid()) {
-                    silent.format.setSampleRate(44100);
-                    silent.format.setChannelCount(1);
-                    silent.format.setSampleFormat(QAudioFormat::Int16);
-                }
-                const int bps = silent.format.bytesPerFrame() * silent.format.sampleRate();
-                const int ms = fallback.durationMs > 0 ? static_cast<int>(fallback.durationMs) : 420;
-                const int bytes = qMax(silent.format.bytesPerFrame(), (bps * ms) / 1000);
-                silent.pcmData.fill('\0', bytes);
-                silent.durationMs = ms;
-                out = silent;
+                // 选择“静音代替”时固定为 0.1 秒静音，避免长静音或帧错位导致后续噪音。
+                out = createSilentAudioMs(100, fallback.format);
             }
         }
         m_stationAudioCache.insert(cacheKey, out);
@@ -4461,9 +4805,28 @@ private:
     void playTrack(int index) {
         if (index < 0 || index >= m_tracks.size()) return;
         const TrackItem &t = m_tracks[index];
+        QString err;
+        if (t.sourceIndex >= 0) {
+            if (t.sourceIndex < 0 || t.sourceIndex >= m_sources.size()) return;
+            const SourceEntry &s = m_sources[t.sourceIndex];
+            const QByteArray bytes = sourceBytes(s, &err);
+            if (bytes.isEmpty()) {
+                appendLog(err, true);
+                QMessageBox::warning(this, QString::fromUtf8(u8"播放失败"),
+                                     err.isEmpty() ? QString::fromUtf8(u8"音频读取失败") : err);
+                return;
+            }
+            stopAndDetachPlayer();
+            m_currentTrack = index;
+            if (!playSourceBytes(bytes, t.title, s.baseFileName, &err, false)) {
+                appendLog(err, true);
+                QMessageBox::warning(this, QString::fromUtf8(u8"播放失败"),
+                                     err.isEmpty() ? QString::fromUtf8(u8"播放失败") : err);
+            }
+            return;
+        }
         if (!QFile::exists(t.encryptedAudioPath)) return;
         QByteArray wavBytes;
-        QString err;
         if (!readEncryptedBlob(t.encryptedAudioPath, m_packKey, &wavBytes, &err)) {
             appendLog(err, true);
             QMessageBox::warning(this, QString::fromUtf8(u8"播放失败"), err);
@@ -4571,11 +4934,12 @@ private:
         m_indicesByLowerStem.clear();
         m_bestResourceByLowerPath.clear();
         m_bestResourceByLowerName.clear();
-        m_entryRawCache.clear();
+        clearEntryRawCache();
         m_entryAudioCache.clear();
         m_stationAudioCache.clear();
         m_stationSourceIdxCache.clear();
         m_resourceAudioCache.clear();
+        m_sessionBlobKey.clear();
         if (!m_sessionDir.isEmpty()) {
             QDir d(m_sessionDir);
             if (d.exists()) d.removeRecursively();
