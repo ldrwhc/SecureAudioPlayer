@@ -1,0 +1,24 @@
+# Build/temp
+debug/
+dist/
+_installer_work/
+player_src/
+.qmake.stash
+Makefile
+Makefile.Debug
+Makefile.Release
+
+# Runtime temp/cache
+_runtime_tmp/
+
+# Large generated artifacts
+release/
+packs/*.pak
+seed_config.zip
+seed_lines.zip
+embedded_payload.qrc
+
+# OS/editor
+*.user
+*.tmp
+Thumbs.db

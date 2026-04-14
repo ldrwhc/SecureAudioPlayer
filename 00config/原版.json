@@ -1,0 +1,32 @@
+{
+    "name": "原版",
+    "resources": {
+        "seq1": "进站原1.mp3",
+        "seq2": "开往原.mp3",
+        "seq3": "进站原3.mp3",
+        "seq4": "起点站原1.mp3",
+        "seq5": "起点站原2.mp3",
+        "seq6": "起点站原3.mp3",
+        "seq7": "终点站原1.mp3",
+        "seq8": "终点站原2.mp3",
+        "seq9": "起点站-4.mp3",
+        "seq10": "下站原1.mp3",
+        "seq11": "下站原2.mp3",
+        "seq12": "下站原3.mp3"
+    },
+    "eng": false,
+    "sequences": {
+        "start_station": [
+            "seq4", "$CURRENT_STATION", "seq2","$TERMINAL", "$LINE", "seq6"
+        ],
+        "enter_station": [
+            "$CURRENT_STATION", "seq1", "$LINE", "seq2",  "$TERMINAL" ,"$LINE", "seq2",  "$TERMINAL" , "seq3"
+        ],
+        "next_station": [
+            "seq10", "seq11",  "$NEXT_STATION", "seq12"
+        ],
+        "terminal_station": [
+            "seq7", "$TERMINAL", "seq8"
+        ]
+    }
+}

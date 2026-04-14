@@ -1,0 +1,39 @@
+{
+    "name": "京杭大运河完整版",
+    "resources": {
+        "seq1": "到站-1.mp3",
+        "seq2": "到站-2.mp3",
+        "seq3": "到站-3.mp3",
+        "seq4": "到站-4.mp3",
+        "seq5": "到站-5.mp3",
+        "seq6": "起点站-1.mp3",
+        "seq7": "起点站-2.mp3",
+        "seq8": "起点站-3.mp3",
+        "seq9": "起点站-4.mp3",
+        "seq10": "起点站-5.mp3",
+        "seq11": "起点站-5.mp3",
+        "seq12": "终点站-1.mp3",
+        "seq13": "终点站-2.mp3",
+        "seq14": "终点站-3.mp3",
+        "seq15": "终点站-4.mp3",
+        "seq16": "下站-1.mp3",
+        "seq17": "下站-2.mp3",
+        "seq18": "下站-3.mp3",
+		"seq19": "京杭大运河.mp3"
+    },
+    "eng": true,
+    "sequences": {
+        "start_station": [
+            "seq6", "$TERMINAL", "seq7", "$LINE", "seq8", "$LINE_NAME_EN", "seq9", "$TERMINAL_EN", "seq10"
+        ],
+        "enter_station": [
+            "seq19","$CURRENT_STATION", "seq1", "$CURRENT_STATION", "seq2", "$CURRENT_STATION_EN", "seq3", "$LINE", "seq4", "$TERMINAL", "seq5"
+        ],
+        "next_station": [
+            "seq16", "$NEXT_STATION", "seq17", "$NEXT_STATION_EN", "seq18"
+        ],
+        "terminal_station": [
+            "seq12", "$TERMINAL", "seq13", "$LINE", "seq14", "$TERMINAL_EN", "seq15"
+        ]
+    }
+}
