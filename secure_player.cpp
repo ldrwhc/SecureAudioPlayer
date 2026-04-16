@@ -1088,6 +1088,7 @@ private:
         bool externalBroadcast = true;
         bool includeNextStation = true;
         bool highQuality = true;
+        bool silentSynthesis = true;
         bool lowPass = false;
         bool blindMode = false;
         bool missingEngUseChinese = false;
@@ -1131,6 +1132,8 @@ private:
             settings.value(QStringLiteral("synth_include_next_station"), m_synthOptions.includeNextStation).toBool();
         m_synthOptions.highQuality =
             settings.value(QStringLiteral("synth_high_quality"), m_synthOptions.highQuality).toBool();
+        m_synthOptions.silentSynthesis =
+            settings.value(QStringLiteral("synth_silent_synthesis"), m_synthOptions.silentSynthesis).toBool();
         m_synthOptions.lowPass =
             settings.value(QStringLiteral("synth_low_pass"), m_synthOptions.lowPass).toBool();
         m_synthOptions.blindMode =
@@ -1163,6 +1166,7 @@ private:
         settings.setValue(QStringLiteral("synth_external_broadcast"), m_synthOptions.externalBroadcast);
         settings.setValue(QStringLiteral("synth_include_next_station"), m_synthOptions.includeNextStation);
         settings.setValue(QStringLiteral("synth_high_quality"), m_synthOptions.highQuality);
+        settings.setValue(QStringLiteral("synth_silent_synthesis"), m_synthOptions.silentSynthesis);
         settings.setValue(QStringLiteral("synth_low_pass"), m_synthOptions.lowPass);
         settings.setValue(QStringLiteral("synth_blind_mode"), m_synthOptions.blindMode);
         settings.setValue(QStringLiteral("synth_missing_eng_use_chinese"), m_synthOptions.missingEngUseChinese);
@@ -4256,6 +4260,7 @@ private:
         QButtonGroup *externalGrp = addBoolRow(QString::fromUtf8(u8"是否外报"), QString::fromUtf8(u8"外报"), QString::fromUtf8(u8"不外报"), m_synthOptions.externalBroadcast);
         QButtonGroup *nextStationGrp = addBoolRow(QString::fromUtf8(u8"是否下站"), QString::fromUtf8(u8"是"), QString::fromUtf8(u8"否"), m_synthOptions.includeNextStation);
         QButtonGroup *qualityGrp = addBoolRow(QString::fromUtf8(u8"高音质优先匹配"), QString::fromUtf8(u8"是"), QString::fromUtf8(u8"否"), m_synthOptions.highQuality);
+        QButtonGroup *silentGrp = addBoolRow(QString::fromUtf8(u8"静默合成（多候选自动选最佳）"), QString::fromUtf8(u8"是"), QString::fromUtf8(u8"否（手动试听选择）"), m_synthOptions.silentSynthesis);
         QButtonGroup *lowPassGrp = addBoolRow(QString::fromUtf8(u8"是否低音质(0-4kHz)"), QString::fromUtf8(u8"是"), QString::fromUtf8(u8"否"), m_synthOptions.lowPass);
         QButtonGroup *blindGrp = addBoolRow(QString::fromUtf8(u8"是否盲人语音"), QString::fromUtf8(u8"是"), QString::fromUtf8(u8"否"), m_synthOptions.blindMode);
 
@@ -4286,15 +4291,17 @@ private:
         m_synthOptions.externalBroadcast = (externalGrp->checkedId() == 1);
         m_synthOptions.includeNextStation = (nextStationGrp->checkedId() == 1);
         m_synthOptions.highQuality = (qualityGrp->checkedId() == 1);
+        m_synthOptions.silentSynthesis = (silentGrp->checkedId() == 1);
         m_synthOptions.lowPass = (lowPassGrp->checkedId() == 1);
         m_synthOptions.blindMode = (blindGrp->checkedId() == 1);
         m_synthOptions.missingEngUseChinese = (missingGrp->checkedId() == 1);
         saveUserPreferences();
 
-        appendLog(QString::fromUtf8(u8"合成参数已确认：外报=%1 下站=%2 高音质=%3 低音质=%4 盲人=%5 英文缺失=%6")
+        appendLog(QString::fromUtf8(u8"合成参数已确认：外报=%1 下站=%2 高音质=%3 静默合成=%4 低音质=%5 盲人=%6 英文缺失=%7")
                       .arg(m_synthOptions.externalBroadcast ? QString::fromUtf8(u8"是") : QString::fromUtf8(u8"否"))
                       .arg(m_synthOptions.includeNextStation ? QString::fromUtf8(u8"是") : QString::fromUtf8(u8"否"))
                       .arg(m_synthOptions.highQuality ? QString::fromUtf8(u8"是") : QString::fromUtf8(u8"否"))
+                      .arg(m_synthOptions.silentSynthesis ? QString::fromUtf8(u8"是") : QString::fromUtf8(u8"否"))
                       .arg(m_synthOptions.lowPass ? QString::fromUtf8(u8"是") : QString::fromUtf8(u8"否"))
                       .arg(m_synthOptions.blindMode ? QString::fromUtf8(u8"是") : QString::fromUtf8(u8"否"))
                       .arg(m_synthOptions.missingEngUseChinese ? QString::fromUtf8(u8"中文回退") : QString::fromUtf8(u8"静音")));
@@ -4339,39 +4346,148 @@ private:
         return score;
     }
 
-    int selectStationSourceIndex(const QString &stationName, bool isChinese) {
+    QVector<int> collectStationSourceCandidates(const QString &stationName, bool isChinese) const {
         const QString clean = stationName.trimmed();
-        if (clean.isEmpty()) return -1;
-        const QString cacheKey = QStringLiteral("%1|%2").arg(isChinese ? QStringLiteral("zh") : QStringLiteral("en")).arg(clean);
-        if (m_stationSourceIdxCache.contains(cacheKey)) return m_stationSourceIdxCache.value(cacheKey);
+        if (clean.isEmpty()) return {};
+
+        QVector<QPair<int, int>> scored;
+        scored.reserve(m_sources.size());
         QVector<int> exactCandidates;
-        int best = -1;
-        int bestScore = -1;
         for (int i = 0; i < m_sources.size(); ++i) {
             const SourceEntry &s = m_sources[i];
             if (isChinese && s.isEnglish) continue;
             if (!isChinese && !s.isEnglish) continue;
             if (!isStationFileMatch(clean, s.stem)) continue;
             if (s.stem == clean) exactCandidates.push_back(i);
-            const int score = stationSourceScore(clean, s);
-            if (score > bestScore) {
-                bestScore = score;
-                best = i;
-            }
+            scored.push_back({i, stationSourceScore(clean, s)});
         }
+        if (scored.isEmpty()) return {};
+
         if (m_synthOptions.highQuality && !exactCandidates.isEmpty()) {
-            best = -1;
-            bestScore = -1;
-            for (int idx : exactCandidates) {
-                const int score = stationSourceScore(clean, m_sources[idx]);
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = idx;
-                }
+            QSet<int> exactSet;
+            for (int idx : std::as_const(exactCandidates)) exactSet.insert(idx);
+            QVector<QPair<int, int>> filtered;
+            filtered.reserve(exactCandidates.size());
+            for (const auto &pair : std::as_const(scored)) {
+                if (exactSet.contains(pair.first)) filtered.push_back(pair);
             }
+            scored = filtered;
         }
-        m_stationSourceIdxCache.insert(cacheKey, best);
-        return best;
+
+        std::sort(scored.begin(), scored.end(), [this](const QPair<int, int> &a, const QPair<int, int> &b) {
+            if (a.second != b.second) return a.second > b.second;
+            const SourceEntry &sa = m_sources[a.first];
+            const SourceEntry &sb = m_sources[b.first];
+            if (sa.baseFileName.size() != sb.baseFileName.size()) return sa.baseFileName.size() < sb.baseFileName.size();
+            return sa.baseFileName.toLower() < sb.baseFileName.toLower();
+        });
+
+        QVector<int> result;
+        result.reserve(scored.size());
+        for (const auto &pair : std::as_const(scored)) result.push_back(pair.first);
+        return result;
+    }
+
+    int pickStationSourceInteractively(const QString &stationName, bool isChinese, const QVector<int> &candidates, int defaultIdx) {
+        if (candidates.isEmpty()) return -1;
+
+        QDialog dlg(this);
+        dlg.setWindowTitle(QString::fromUtf8(u8"%1 - 选择%2音频").arg(stationName, isChinese ? QString::fromUtf8(u8"中文") : QString::fromUtf8(u8"英文")));
+        dlg.setModal(true);
+        dlg.resize(560, 420);
+
+        auto *root = new QVBoxLayout(&dlg);
+        auto *hint = new QLabel(QString::fromUtf8(u8"匹配到多个候选，请试听后选择。取消将回退到默认候选。"), &dlg);
+        root->addWidget(hint);
+
+        auto *list = new QListWidget(&dlg);
+        int defaultRow = 0;
+        for (int row = 0; row < candidates.size(); ++row) {
+            const int idx = candidates[row];
+            const SourceEntry &s = m_sources[idx];
+            auto *item = new QListWidgetItem(QStringLiteral("%1  [%2]").arg(s.baseFileName, s.stem), list);
+            item->setData(Qt::UserRole, idx);
+            if (idx == defaultIdx) defaultRow = row;
+        }
+        list->setCurrentRow(defaultRow);
+        root->addWidget(list, 1);
+
+        auto *btnRow = new QHBoxLayout();
+        auto *previewBtn = new QPushButton(QString::fromUtf8(u8"试听"), &dlg);
+        auto *selectBtn = new QPushButton(QString::fromUtf8(u8"选择"), &dlg);
+        auto *cancelBtn = new QPushButton(QString::fromUtf8(u8"取消"), &dlg);
+        btnRow->addWidget(previewBtn);
+        btnRow->addStretch();
+        btnRow->addWidget(selectBtn);
+        btnRow->addWidget(cancelBtn);
+        root->addLayout(btnRow);
+
+        int selectedIdx = defaultIdx;
+
+        auto chooseCurrent = [&]() {
+            if (auto *item = list->currentItem()) {
+                selectedIdx = item->data(Qt::UserRole).toInt();
+                dlg.accept();
+            } else {
+                QMessageBox::warning(&dlg, QString::fromUtf8(u8"候选选择"), QString::fromUtf8(u8"请先选择一个候选音频"));
+            }
+        };
+
+        connect(previewBtn, &QPushButton::clicked, &dlg, [&]() {
+            auto *item = list->currentItem();
+            if (!item) {
+                QMessageBox::warning(&dlg, QString::fromUtf8(u8"候选试听"), QString::fromUtf8(u8"请先选择一个候选音频"));
+                return;
+            }
+            const int idx = item->data(Qt::UserRole).toInt();
+            if (idx < 0 || idx >= m_sources.size()) return;
+            QString err;
+            const QByteArray bytes = sourceBytes(m_sources[idx], &err);
+            if (bytes.isEmpty()) {
+                QMessageBox::warning(&dlg, QString::fromUtf8(u8"候选试听"),
+                                     err.isEmpty() ? QString::fromUtf8(u8"读取音频失败") : err);
+                return;
+            }
+            if (!playSourceBytes(bytes, QString::fromUtf8(u8"试听: %1").arg(m_sources[idx].baseFileName),
+                                 m_sources[idx].baseFileName, &err, false)) {
+                QMessageBox::warning(&dlg, QString::fromUtf8(u8"候选试听"),
+                                     err.isEmpty() ? QString::fromUtf8(u8"播放失败") : err);
+            }
+        });
+        connect(selectBtn, &QPushButton::clicked, &dlg, chooseCurrent);
+        connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+        connect(list, &QListWidget::itemDoubleClicked, &dlg, [&](QListWidgetItem *) { chooseCurrent(); });
+
+        if (dlg.exec() == QDialog::Accepted) {
+            return selectedIdx;
+        }
+
+        appendLog(QString::fromUtf8(u8"站名“%1”候选选择取消，已回退到默认候选").arg(stationName), true);
+        return defaultIdx;
+    }
+
+    int selectStationSourceIndex(const QString &stationName, bool isChinese) {
+        const QString clean = stationName.trimmed();
+        if (clean.isEmpty()) return -1;
+        const QString cacheKey = QStringLiteral("%1|%2|%3|%4")
+                                     .arg(isChinese ? QStringLiteral("zh") : QStringLiteral("en"))
+                                     .arg(clean)
+                                     .arg(m_synthOptions.highQuality ? QStringLiteral("1") : QStringLiteral("0"))
+                                     .arg(m_synthOptions.silentSynthesis ? QStringLiteral("1") : QStringLiteral("0"));
+        if (m_stationSourceIdxCache.contains(cacheKey)) return m_stationSourceIdxCache.value(cacheKey);
+
+        const QVector<int> candidates = collectStationSourceCandidates(clean, isChinese);
+        if (candidates.isEmpty()) {
+            m_stationSourceIdxCache.insert(cacheKey, -1);
+            return -1;
+        }
+
+        int picked = candidates.first();
+        if (!m_synthOptions.silentSynthesis && candidates.size() > 1) {
+            picked = pickStationSourceInteractively(clean, isChinese, candidates, picked);
+        }
+        m_stationSourceIdxCache.insert(cacheKey, picked);
+        return picked;
     }
 
     AudioData resolveStationAudio(const QString &stationName, bool isChinese, const AudioData &fallback = AudioData()) {
